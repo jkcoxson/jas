@@ -1,5 +1,5 @@
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use sqlx::SqlitePool;
 
 use crate::server::{config::Config, crypto::Crypto};
@@ -39,6 +39,7 @@ pub struct AppState {
     pub crypto: Crypto,
     pub job_tx: mpsc::Sender<JobRequest>,
     pub pending_logins: Arc<Mutex<HashMap<String, Arc<PendingLogin>>>>,
+    pub anisette_url: Arc<RwLock<String>>,
 }
 
 impl AppState {
@@ -47,6 +48,7 @@ impl AppState {
         config: Config,
         key: [u8; 32],
         job_tx: mpsc::Sender<JobRequest>,
+        anisette_url: String,
     ) -> Self {
         Self {
             db,
@@ -54,6 +56,7 @@ impl AppState {
             crypto: Crypto::new(key),
             job_tx,
             pending_logins: Arc::new(Mutex::new(HashMap::new())),
+            anisette_url: Arc::new(RwLock::new(anisette_url)),
         }
     }
 }

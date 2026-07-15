@@ -214,6 +214,8 @@ async fn run_job(state: &AppState, req: &JobRequest) -> anyhow::Result<String> {
     .await?
     .ok_or_else(|| anyhow::anyhow!("Account {} not found", req.account_id))?;
 
+    let anisette_url = state.anisette_url.read().await.clone();
+
     if let JobKind::Refresh = req.kind {
         let app = db::get_app(&state.db, &req.app_id)
             .await?
@@ -231,6 +233,7 @@ async fn run_job(state: &AppState, req: &JobRequest) -> anyhow::Result<String> {
             device.mdns_ip.as_deref(),
             &device.pairing_blob,
             &app.bundle_id,
+            &anisette_url,
         )
         .await
         {
@@ -268,6 +271,7 @@ async fn run_job(state: &AppState, req: &JobRequest) -> anyhow::Result<String> {
         &device.udid,
         &device.pairing_blob,
         &ipa_path,
+        &anisette_url,
         move |progress, stage| {
             let db = db.clone();
             let job_id = job_id.clone();

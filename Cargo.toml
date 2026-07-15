@@ -21,12 +21,17 @@ tokio = { version = "1", features = [
   "macros",
 ], optional = true }
 wasm-bindgen = { version = "0.2.106", optional = true }
+js-sys = { version = "0.3", optional = true }
 web-sys = { version = "0.3", features = [
+  "Document",
+  "Element",
+  "EventTarget",
   "File",
   "FileList",
   "FileReader",
+  "HtmlAnchorElement",
+  "HtmlElement",
   "HtmlInputElement",
-  "EventTarget",
   "Window",
 ], optional = true }
 
@@ -78,6 +83,7 @@ zip = { version = "2", default-features = false, features = [
 hydrate = [
   "leptos/hydrate",
   "dep:console_error_panic_hook",
+  "dep:js-sys",
   "dep:wasm-bindgen",
   "dep:web-sys",
 ]

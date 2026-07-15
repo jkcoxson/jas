@@ -203,6 +203,27 @@ pub async fn fetch_device_identity(
     Ok((udid, name))
 }
 
+/// TCP-level reachability check on port 49152. Returns round-trip ms.
+pub async fn tcp_ping(device_ip: &str, mdns_ip: Option<&str>) -> anyhow::Result<u64> {
+    let ip = mdns_ip.filter(|&m| m != device_ip).unwrap_or(device_ip);
+    let start = std::time::Instant::now();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect((ip, 49152u16)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("TCP connect to {ip}:49152 timed out"))?
+    .map_err(|e| anyhow::anyhow!("TCP connect to {ip}:49152 failed: {e}"))?;
+    Ok(start.elapsed().as_millis() as u64)
+}
+
+/// Parse a pairing plist to confirm it is structurally valid.
+pub fn validate_pairing_bytes(bytes: &[u8]) -> anyhow::Result<()> {
+    RpPairingFile::from_bytes(bytes)
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Invalid pairing file: {e:?}"))
+}
+
 /// Storage prefix used to scope anisette state (and other sideload storage)
 /// to a single Apple ID. Stable across runs so the persisted anisette identity
 /// matches the one the cached SPD/GsIdmsToken was minted against.
@@ -218,6 +239,7 @@ pub fn account_storage_prefix(apple_id: &str) -> String {
 pub async fn build_anisette_provider(
     pool: &SqlitePool,
     apple_id: &str,
+    anisette_url: &str,
 ) -> anyhow::Result<RemoteV3AnisetteProvider> {
     let prefix = account_storage_prefix(apple_id);
     let storage = DbStorage::load(pool.clone(), &prefix)
@@ -226,6 +248,7 @@ pub async fn build_anisette_provider(
 
     Ok(RemoteV3AnisetteProvider::default()
         .map_err(|e| anyhow::anyhow!("Anisette init failed: {e}"))?
+        .set_url(anisette_url)
         .set_storage(Box::new(storage)))
 }
 
@@ -234,12 +257,13 @@ pub async fn restore_account(
     apple_id: &str,
     encrypted_spd: &[u8],
     crypto: &Crypto,
+    anisette_url: &str,
 ) -> anyhow::Result<AppleAccount> {
     let spd_bytes = crypto
         .decrypt(encrypted_spd)
         .map_err(|_| anyhow::anyhow!("Failed to decrypt account session"))?;
 
-    let provider = build_anisette_provider(pool, apple_id).await?;
+    let provider = build_anisette_provider(pool, apple_id, anisette_url).await?;
 
     let anisette_generator = isideload::anisette::AnisetteDataGenerator::new(std::sync::Arc::new(
         tokio::sync::RwLock::new(provider),
@@ -328,12 +352,13 @@ pub async fn get_dev_session(
     apple_id: &str,
     encrypted_spd: &[u8],
     crypto: &Crypto,
+    anisette_url: &str,
 ) -> anyhow::Result<DeveloperSession> {
     let storage = DbStorage::load(pool.clone(), &account_storage_prefix(apple_id))
         .await
         .map_err(|e| anyhow::anyhow!("Storage load failed: {e}"))?;
 
-    let provider = build_anisette_provider(pool, apple_id).await?;
+    let provider = build_anisette_provider(pool, apple_id, anisette_url).await?;
     let anisette_generator =
         AnisetteDataGenerator::new(std::sync::Arc::new(tokio::sync::RwLock::new(provider)));
 
@@ -369,7 +394,7 @@ pub async fn get_dev_session(
     }
 
     // if failure, remint xcode token
-    let mut account = restore_account(pool, apple_id, encrypted_spd, crypto).await?;
+    let mut account = restore_account(pool, apple_id, encrypted_spd, crypto, anisette_url).await?;
     let token = match cache_xcode_token_from_account(pool, &mut account).await {
         Ok(t) => t,
         Err(e) => return Err(e),
@@ -520,13 +545,14 @@ pub async fn install_ipa(
     device_udid: &str,
     encrypted_pairing: &[u8],
     ipa_path: &str,
+    anisette_url: &str,
     progress_cb: impl Fn(u64, &'static str) + Send + 'static,
 ) -> anyhow::Result<String> {
     let db_storage = DbStorage::load(pool.clone(), &account_storage_prefix(apple_id))
         .await
         .map_err(|e| anyhow::anyhow!("Storage load failed: {e}"))?;
 
-    let dev_session = get_dev_session(pool, apple_id, encrypted_spd, crypto).await?;
+    let dev_session = get_dev_session(pool, apple_id, encrypted_spd, crypto, anisette_url).await?;
 
     let mut sideloader = SideloaderBuilder::new(dev_session, apple_id.to_string())
         .team_selection(TeamSelection::First)
@@ -668,8 +694,9 @@ pub async fn refresh_provisioning_profile(
     mdns_ip: Option<&str>,
     encrypted_pairing: &[u8],
     bundle_id: &str,
+    anisette_url: &str,
 ) -> anyhow::Result<()> {
-    let mut dev_session = get_dev_session(pool, apple_id, encrypted_spd, crypto).await?;
+    let mut dev_session = get_dev_session(pool, apple_id, encrypted_spd, crypto, anisette_url).await?;
 
     let teams = dev_session
         .list_teams()

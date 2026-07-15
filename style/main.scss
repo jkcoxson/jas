@@ -255,6 +255,11 @@ body {
   letter-spacing: 0.05em;
 }
 
+// Live connection status
+.badge-online  { background: #166534; color: #dcfce7; }
+.badge-stale   { background: #78350f; color: #fde68a; }
+.badge-offline { background: #374151; color: #d1d5db; }
+
 // Device grid
 .device-grid {
   display: grid;
@@ -337,38 +342,93 @@ body {
 
 code { font-family: monospace; background: var(--border); padding: 2px 6px; border-radius: 4px; }
 
-// Mobile :(
+// Mobile
 @media (max-width: 640px) {
   .nav {
-    padding: 0 12px;
-    gap: 4px;
+    padding: 0 10px;
+    gap: 0;
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
     white-space: nowrap;
+    scrollbar-width: none;
+    &::-webkit-scrollbar { display: none; }
   }
-  .nav-brand { margin-right: 8px; font-size: 16px; }
-  .nav-link { padding: 6px 8px; }
+  .nav-brand { margin-right: 4px; font-size: 15px; }
+  .nav-link { padding: 5px 8px; font-size: 13px; }
 
-  .main-content { padding: 20px 12px; }
+  .main-content { padding: 16px 12px; }
 
   .page { gap: 16px; }
   .page-header { margin-bottom: 16px; h1 { font-size: 20px; } }
 
-  .card { padding: 16px; }
-  .card h2 { font-size: 15px; }
+  .card { padding: 14px 12px; min-width: 0; }
+  .card h2 { font-size: 15px; margin-bottom: 12px; }
 
   .form-row { gap: 12px; }
   .form-field { min-width: 0; flex-basis: 100%; }
+  // font-size ≥16px prevents iOS Safari from zooming on input focus
+  .form-field input,
+  .form-field select,
+  .form-field textarea { font-size: 16px; }
 
   .table, .info-table { font-size: 12px; }
-  .table th, .table td { padding: 8px 8px; }
+  .table th, .table td { padding: 8px 6px; }
+  .table .mono { word-break: break-all; white-space: normal; }
   .info-table th { width: auto; padding-right: 12px; }
+  .info-table td { word-break: break-word; }
 
   .device-grid { grid-template-columns: 1fr; gap: 12px; }
 
-  .actions { flex-wrap: wrap; }
-  .btn { padding: 8px 12px; }
+  .actions {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+    form { width: 100%; }
+    .btn, button { width: 100%; justify-content: center; }
+  }
+
+  .btn { padding: 9px 12px; }
+  .btn-sm { font-size: 12px; }
+
+  .device-card-footer { flex-wrap: wrap; gap: 4px; }
 }
 
+// Cards contain their inner tables; prevent page-wide blowout on narrow viewports
 .card { max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
 .main-content { min-width: 0; }
+
+.lc-cert-export { margin-top: 16px; }
+.lc-cert-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+
+// Device management section
+.device-mgmt-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+
+  &:last-child { border-bottom: none; }
+
+  form { margin: 0; }
+}
+
+.device-mgmt-inline {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+
+  .form-field { margin-bottom: 0; }
+}
+
+.btn-mgmt-submit { align-self: flex-end; margin-bottom: 2px; }
+
+.device-mgmt-expand {
+  padding: 12px 0 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+// Card body helpers
+.card-desc { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
+.form-msg   { margin-top: 8px; }

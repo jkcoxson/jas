@@ -136,6 +136,20 @@ pub async fn insert_device(
     Ok(())
 }
 
+pub async fn update_device_ip(pool: &SqlitePool, id: &str, ip: &str) -> sqlx::Result<()> {
+    sqlx::query!("UPDATE devices SET ip = ? WHERE id = ?", ip, id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn update_device_pairing(pool: &SqlitePool, id: &str, blob: &[u8]) -> sqlx::Result<()> {
+    sqlx::query!("UPDATE devices SET pairing_blob = ? WHERE id = ?", blob, id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn delete_device(pool: &SqlitePool, id: &str) -> sqlx::Result<()> {
     sqlx::query!("DELETE FROM devices WHERE id = ?", id)
         .execute(pool)
@@ -369,6 +383,62 @@ pub async fn set_app_refresh(pool: &SqlitePool, app_id: &str, enabled: bool) -> 
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct JobWithContext {
+    pub id: String,
+    pub app_id: String,
+    pub app_name: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub kind: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub progress: i64,
+    pub stage: Option<String>,
+}
+
+/// Lists jobs for the queue view, most-recently-created first, with active
+/// (running, then queued) jobs surfaced ahead of finished ones.
+pub async fn list_jobs(pool: &SqlitePool, limit: i64) -> sqlx::Result<Vec<JobWithContext>> {
+    let rows = sqlx::query(
+        "SELECT j.id, j.app_id, a.display_name as app_name, a.device_id as device_id, \
+                d.name as device_name, j.kind, j.status, j.error, j.started_at, \
+                j.finished_at, j.progress, j.stage \
+         FROM jobs j \
+         JOIN apps a ON a.id = j.app_id \
+         JOIN devices d ON d.id = a.device_id \
+         ORDER BY CASE j.status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, \
+                  j.rowid DESC \
+         LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            use sqlx::Row;
+            JobWithContext {
+                id: r.get("id"),
+                app_id: r.get("app_id"),
+                app_name: r.get("app_name"),
+                device_id: r.get("device_id"),
+                device_name: r.get("device_name"),
+                kind: r.get("kind"),
+                status: r.get("status"),
+                error: r.get("error"),
+                started_at: r.get("started_at"),
+                finished_at: r.get("finished_at"),
+                progress: r.get("progress"),
+                stage: r.get("stage"),
+            }
+        })
+        .collect())
 }
 
 pub async fn get_job(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<JobRow>> {

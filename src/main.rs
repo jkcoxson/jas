@@ -36,13 +36,23 @@ async fn main() {
     let pool = create_pool(&config).await.expect("Database init failed");
     info!("Database ready at {}", config.storage.database_path);
 
+    let anisette_url = sqlx::query_scalar!(
+        "SELECT value FROM sideload_storage WHERE key = '_server/anisette_url'"
+    )
+    .fetch_optional(&pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "https://ani.stikstore.app".to_string());
+    info!("Anisette server: {anisette_url}");
+
     // Derive encryption key.
     let key = config.secret_key_bytes();
 
     // Job queue channel.
     let (job_tx, job_rx) = mpsc::channel::<jas::server::state::JobRequest>(256);
 
-    let app_state = AppState::new(pool, config.clone(), key, job_tx);
+    let app_state = AppState::new(pool, config.clone(), key, job_tx, anisette_url);
 
     // Spawn the refresh scheduler.
     {

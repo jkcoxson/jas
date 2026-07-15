@@ -46,6 +46,9 @@ pub fn App() -> impl IntoView {
                 <A href="/accounts" attr:class="nav-link">
                     "Accounts"
                 </A>
+                <A href="/queue" attr:class="nav-link">
+                    "Queue"
+                </A>
                 <A href="/settings" attr:class="nav-link">
                     "Settings"
                 </A>
@@ -56,6 +59,7 @@ pub fn App() -> impl IntoView {
                     <Route path=StaticSegment("devices") view=pages::devices::Devices />
                     <Route path=path!("/devices/:id") view=pages::device_detail::DeviceDetail />
                     <Route path=StaticSegment("accounts") view=pages::accounts::Accounts />
+                    <Route path=StaticSegment("queue") view=pages::queue::Queue />
                     <Route path=StaticSegment("settings") view=pages::settings::Settings />
                 </Routes>
             </main>
@@ -97,6 +101,28 @@ pub struct AccountInfo {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LcCertExport {
+    pub p12_b64: String,
+    pub serial: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AppIdEntry {
+    pub name: String,
+    pub identifier: String,
+    /// Unix timestamp (seconds) the App ID's certificate expires at.
+    pub expiration_date: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AppIdsResult {
+    pub entries: Vec<AppIdEntry>,
+    pub max_quantity: Option<u64>,
+    pub available_quantity: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppInfo {
     pub id: String,
     pub device_id: String,
@@ -113,6 +139,22 @@ pub struct AppInfo {
 pub struct JobInfo {
     pub id: String,
     pub app_id: String,
+    pub kind: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub progress: i64,
+    pub stage: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct QueueEntry {
+    pub id: String,
+    pub app_id: String,
+    pub app_name: String,
+    pub device_id: String,
+    pub device_name: String,
     pub kind: String,
     pub status: String,
     pub error: Option<String>,
@@ -332,9 +374,14 @@ pub async fn begin_login(
             .expect("tokio runtime");
 
         let outcome: Result<LoginData, String> = rt.block_on(async move {
-            let provider = sideload::build_anisette_provider(&state_clone.db, &apple_id_clone)
-                .await
-                .map_err(|e| format!("Anisette init: {e}"))?;
+            let anisette_url = state_clone.anisette_url.read().await.clone();
+            let provider = sideload::build_anisette_provider(
+                &state_clone.db,
+                &apple_id_clone,
+                &anisette_url,
+            )
+            .await
+            .map_err(|e| format!("Anisette init: {e}"))?;
 
             let anisette_generator = isideload::anisette::AnisetteDataGenerator::new(Arc::new(
                 tokio::sync::RwLock::new(provider),
@@ -492,6 +539,164 @@ pub async fn delete_account(id: String) -> Result<(), ServerFnError> {
 }
 
 #[server]
+pub async fn export_livecontainer_cert(
+    account_id: String,
+) -> Result<LcCertExport, ServerFnError> {
+    use base64::prelude::*;
+    use crate::server::{db, sideload, state::AppState};
+    use crate::server::db::storage::DbStorage;
+    use isideload::{
+        dev::teams::TeamsApi,
+        sideload::{builder::MaxCertsBehavior, cert_identity::CertificateIdentity},
+    };
+    use leptos::prelude::use_context;
+
+    let state = use_context::<AppState>().ok_or_else(|| ServerFnError::new("No state"))?;
+
+    let row = db::list_accounts(&state.db)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .into_iter()
+        .find(|r| r.id == account_id)
+        .ok_or_else(|| ServerFnError::new("Account not found"))?;
+
+    let encrypted_spd = sqlx::query_scalar!(
+        "SELECT session_blob FROM apple_accounts WHERE id = ?",
+        account_id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| ServerFnError::new(e.to_string()))?
+    .ok_or_else(|| ServerFnError::new("No session blob found for account"))?;
+
+    let anisette_url = state.anisette_url.read().await.clone();
+    let mut dev_session =
+        sideload::get_dev_session(
+            &state.db,
+            &row.apple_id,
+            &encrypted_spd,
+            &state.crypto,
+            &anisette_url,
+        )
+            .await
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let teams = dev_session
+        .list_teams()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let team = teams
+        .into_iter()
+        .next()
+        .ok_or_else(|| ServerFnError::new("No developer team found for this account"))?;
+
+    let db_storage = DbStorage::load(
+        state.db.clone(),
+        &sideload::account_storage_prefix(&row.apple_id),
+    )
+    .await
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let cert = CertificateIdentity::retrieve(
+        "jas",
+        &row.apple_id,
+        &mut dev_session,
+        &team,
+        &db_storage,
+        &MaxCertsBehavior::Revoke,
+    )
+    .await
+    .map_err(|e| ServerFnError::new(format!("Failed to retrieve certificate: {e}")))?;
+
+    let p12_bytes = cert
+        .as_p12(&cert.machine_id)
+        .await
+        .map_err(|e| ServerFnError::new(format!("Failed to export P12: {e}")))?;
+
+    Ok(LcCertExport {
+        p12_b64: BASE64_STANDARD.encode(&p12_bytes),
+        serial: cert.get_serial_number(),
+        password: cert.machine_id.clone(),
+    })
+}
+
+#[server]
+pub async fn list_account_app_ids(account_id: String) -> Result<AppIdsResult, ServerFnError> {
+    use crate::server::{db, sideload, state::AppState};
+    use isideload::dev::{app_ids::AppIdsApi, teams::TeamsApi};
+    use leptos::prelude::use_context;
+
+    let state = use_context::<AppState>().ok_or_else(|| ServerFnError::new("No state"))?;
+
+    let row = db::list_accounts(&state.db)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .into_iter()
+        .find(|r| r.id == account_id)
+        .ok_or_else(|| ServerFnError::new("Account not found"))?;
+
+    let encrypted_spd = sqlx::query_scalar!(
+        "SELECT session_blob FROM apple_accounts WHERE id = ?",
+        account_id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| ServerFnError::new(e.to_string()))?
+    .ok_or_else(|| ServerFnError::new("No session blob found for account"))?;
+
+    let anisette_url = state.anisette_url.read().await.clone();
+    let mut dev_session =
+        sideload::get_dev_session(
+            &state.db,
+            &row.apple_id,
+            &encrypted_spd,
+            &state.crypto,
+            &anisette_url,
+        )
+            .await
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let teams = dev_session
+        .list_teams()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let team = teams
+        .into_iter()
+        .next()
+        .ok_or_else(|| ServerFnError::new("No developer team found for this account"))?;
+
+    let resp = dev_session
+        .list_app_ids(&team, None)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let max_quantity = resp.max_quantity;
+    let available_quantity = resp.available_quantity;
+    let entries = resp
+        .app_ids
+        .into_iter()
+        .map(|a| {
+            let expiration_date = a.expiration_date.map(|d| {
+                let st: std::time::SystemTime = d.into();
+                let dt: chrono::DateTime<chrono::Utc> = st.into();
+                dt.timestamp()
+            });
+            AppIdEntry {
+                name: a.name,
+                identifier: a.identifier,
+                expiration_date,
+            }
+        })
+        .collect();
+
+    Ok(AppIdsResult {
+        entries,
+        max_quantity,
+        available_quantity,
+    })
+}
+
+#[server]
 pub async fn list_apps(device_id: String) -> Result<Vec<AppInfo>, ServerFnError> {
     use crate::server::{db, state::AppState};
     use leptos::prelude::use_context;
@@ -592,16 +797,21 @@ pub async fn install_ipa(
         return Err(ServerFnError::new("account_id is empty, select an account"));
     }
 
-    // Verify FK references exist before touching the DB, so errors are readable.
-    let device_exists = sqlx::query_scalar!("SELECT COUNT(*) FROM devices WHERE id = ?", device_id)
-        .fetch_one(&state.db)
+    // Verify the device exists and is reachable before doing any work. A quick
+    // TCP probe here means a disconnected device fails fast with a clear error
+    // instead of ~10s into a sign+install.
+    let device = db::get_device(&state.db, &device_id)
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    if device_exists == 0 {
-        return Err(ServerFnError::new(format!(
-            "Device '{device_id}' not found in DB"
-        )));
-    }
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .ok_or_else(|| ServerFnError::new(format!("Device '{device_id}' not found in DB")))?;
+
+    sideload::tcp_ping(&device.ip, device.mdns_ip.as_deref())
+        .await
+        .map_err(|e| {
+            ServerFnError::new(format!(
+                "Device is not reachable ({e}). Make sure it is powered on and on the same network, then try again."
+            ))
+        })?;
 
     let account_exists = sqlx::query_scalar!(
         "SELECT COUNT(*) FROM apple_accounts WHERE id = ?",
@@ -784,6 +994,35 @@ pub async fn refresh_device(device_id: String) -> Result<usize, ServerFnError> {
 }
 
 #[server]
+pub async fn list_jobs() -> Result<Vec<QueueEntry>, ServerFnError> {
+    use crate::server::{db, state::AppState};
+    use leptos::prelude::use_context;
+
+    let state = use_context::<AppState>().ok_or_else(|| ServerFnError::new("No state"))?;
+    let rows = db::list_jobs(&state.db, 20)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| QueueEntry {
+            id: r.id,
+            app_id: r.app_id,
+            app_name: r.app_name,
+            device_id: r.device_id,
+            device_name: r.device_name,
+            kind: r.kind,
+            status: r.status,
+            error: r.error,
+            started_at: r.started_at,
+            finished_at: r.finished_at,
+            progress: r.progress,
+            stage: r.stage,
+        })
+        .collect())
+}
+
+#[server]
 pub async fn job_status(job_id: String) -> Result<JobInfo, ServerFnError> {
     use crate::server::{db, state::AppState};
     use leptos::prelude::use_context;
@@ -858,6 +1097,72 @@ pub async fn delete_app(app_id: String) -> Result<(), ServerFnError> {
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
+/// Return the decrypted pairing plist as base64 so the client can download it.
+#[server]
+pub async fn export_pairing(device_id: String) -> Result<String, ServerFnError> {
+    use base64::prelude::*;
+    use crate::server::{db, state::AppState};
+    use leptos::prelude::use_context;
+
+    let state = use_context::<AppState>().ok_or_else(|| ServerFnError::new("No state"))?;
+    let device = db::get_device(&state.db, &device_id)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .ok_or_else(|| ServerFnError::new("Device not found"))?;
+
+    let bytes = state
+        .crypto
+        .decrypt(&device.pairing_blob)
+        .map_err(|_| ServerFnError::new("Failed to decrypt pairing"))?;
+
+    Ok(BASE64_STANDARD.encode(&bytes))
+}
+
+/// Replace a device's pairing file after validating the new plist.
+#[server]
+pub async fn reimport_pairing(
+    device_id: String,
+    pairing_blob_b64: String,
+) -> Result<(), ServerFnError> {
+    use base64::prelude::*;
+    use crate::server::{db, sideload, state::AppState};
+    use leptos::prelude::use_context;
+
+    let state = use_context::<AppState>().ok_or_else(|| ServerFnError::new("No state"))?;
+
+    db::get_device(&state.db, &device_id)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .ok_or_else(|| ServerFnError::new("Device not found"))?;
+
+    let bytes = BASE64_STANDARD
+        .decode(&pairing_blob_b64)
+        .map_err(|e| ServerFnError::new(format!("Invalid base64: {e}")))?;
+
+    sideload::validate_pairing_bytes(&bytes).map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let encrypted = state.crypto.encrypt(&bytes);
+    db::update_device_pairing(&state.db, &device_id, &encrypted)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// Update the static IP stored for a device.
+#[server]
+pub async fn change_device_ip(device_id: String, ip: String) -> Result<(), ServerFnError> {
+    use crate::server::{db, state::AppState};
+    use leptos::prelude::use_context;
+
+    let state = use_context::<AppState>().ok_or_else(|| ServerFnError::new("No state"))?;
+    let ip = ip.trim().to_string();
+    if ip.is_empty() {
+        return Err(ServerFnError::new("IP must not be empty"));
+    }
+    db::update_device_ip(&state.db, &device_id, &ip)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
 /// Revoke all iOS development certificates for an account.
 /// Returns the number of certs revoked.
 #[server]
@@ -884,8 +1189,15 @@ pub async fn revoke_all_certs(account_id: String) -> Result<usize, ServerFnError
     .map_err(|e| ServerFnError::new(e.to_string()))?
     .ok_or_else(|| ServerFnError::new("No session blob found for account"))?;
 
+    let anisette_url = state.anisette_url.read().await.clone();
     let mut dev_session =
-        sideload::get_dev_session(&state.db, &row.apple_id, &encrypted_spd, &state.crypto)
+        sideload::get_dev_session(
+            &state.db,
+            &row.apple_id,
+            &encrypted_spd,
+            &state.crypto,
+            &anisette_url,
+        )
             .await
             .map_err(|e| ServerFnError::new(e.to_string()))?;
 
@@ -952,9 +1264,42 @@ pub async fn get_device_info(id: String) -> Result<DeviceInfo, ServerFnError> {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeviceProbe {
+    /// Round-trip time in ms if a live TCP probe to the device succeeded just now.
+    pub reachable_ms: Option<u64>,
+    pub mdns_seen_at: Option<i64>,
+}
+
+/// Actively TCP-probes the device (preferring its mDNS LAN IP, falling back
+/// to the manual IP) so the UI can show real-time reachability instead of
+/// relying solely on the last mDNS sighting, which never fires for
+/// VPN-only devices.
+#[server]
+pub async fn probe_device(device_id: String) -> Result<DeviceProbe, ServerFnError> {
+    use crate::server::{db, sideload, state::AppState};
+    use leptos::prelude::use_context;
+
+    let state = use_context::<AppState>().ok_or_else(|| ServerFnError::new("No state"))?;
+    let device = db::get_device(&state.db, &device_id)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .ok_or_else(|| ServerFnError::new("Device not found"))?;
+
+    let reachable_ms = sideload::tcp_ping(&device.ip, device.mdns_ip.as_deref())
+        .await
+        .ok();
+
+    Ok(DeviceProbe {
+        reachable_ms,
+        mdns_seen_at: device.mdns_seen_at,
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ServerConfigInfo {
     pub bind: String,
     pub log_level: String,
+    pub anisette_url: String,
     pub database_path: String,
     pub ipa_dir: String,
     pub interval_hours: u64,
@@ -971,9 +1316,11 @@ pub async fn get_server_config() -> Result<ServerConfigInfo, ServerFnError> {
 
     let state = use_context::<AppState>().ok_or_else(|| ServerFnError::new("No state"))?;
     let cfg = &state.config;
+    let anisette_url = state.anisette_url.read().await.clone();
     Ok(ServerConfigInfo {
         bind: cfg.server.bind.clone(),
         log_level: cfg.server.log_level.clone(),
+        anisette_url,
         database_path: cfg.storage.database_path.clone(),
         ipa_dir: cfg.storage.ipa_dir.clone(),
         interval_hours: cfg.scheduler.interval_hours,
@@ -982,4 +1329,29 @@ pub async fn get_server_config() -> Result<ServerConfigInfo, ServerFnError> {
         mdns_enabled: cfg.discovery.mdns_enabled,
         mdns_interface: cfg.discovery.mdns_interface.clone(),
     })
+}
+
+#[server]
+pub async fn set_anisette_url(url: String) -> Result<(), ServerFnError> {
+    use crate::server::state::AppState;
+    use leptos::prelude::use_context;
+
+    let state = use_context::<AppState>().ok_or_else(|| ServerFnError::new("No state"))?;
+
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return Err(ServerFnError::new("URL must not be empty"));
+    }
+
+    sqlx::query!(
+        "INSERT INTO sideload_storage (key, value) VALUES ('_server/anisette_url', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        url
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    *state.anisette_url.write().await = url;
+    Ok(())
 }

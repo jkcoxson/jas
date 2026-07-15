@@ -1,6 +1,7 @@
 use leptos::prelude::*;
 use leptos_router::components::A;
 
+use crate::app::components::round_up_duration;
 use crate::app::{dashboard_summary, DeviceSummary, RefreshDevice};
 
 #[component]
@@ -158,7 +159,7 @@ fn expiry_line(
         return "No apps tracked".to_string();
     }
     match next_expires_at {
-        Some(ts) => format!("Next expires in {}", format_duration(ts - now)),
+        Some(ts) => format!("Next expires in {}", round_up_duration(ts - now)),
         None if expired_count > 0 => "All expired".to_string(),
         None => "—".to_string(),
     }
@@ -194,19 +195,4 @@ fn counts_line(expiring_soon: usize, expired: usize) -> Option<String> {
         parts.push(format!("{expired} expired"));
     }
     Some(parts.join(", "))
-}
-
-/// Formats a positive duration in seconds as a compact "Xd Yh" / "Xh Ym" / "Xm" string.
-fn format_duration(secs: i64) -> String {
-    let s = secs.max(0);
-    let days = s / 86400;
-    let hours = (s % 86400) / 3600;
-    let mins = (s % 3600) / 60;
-    if days > 0 {
-        format!("{days}d {hours}h")
-    } else if hours > 0 {
-        format!("{hours}h {mins}m")
-    } else {
-        format!("{mins}m")
-    }
 }

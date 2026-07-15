@@ -1,13 +1,23 @@
 use leptos::prelude::*;
 
-use crate::app::components::confirm;
-use crate::app::{begin_login, complete_login, list_accounts, DeleteAccount, RevokeAllCerts};
+use crate::app::components::{confirm, round_up_duration};
+use crate::app::{
+    begin_login, complete_login, export_livecontainer_cert, list_account_app_ids, list_accounts,
+    AppIdsResult, DeleteAccount, LcCertExport, RevokeAllCerts,
+};
 
 #[component]
 pub fn Accounts() -> impl IntoView {
     let accounts = Resource::new(|| (), |_| list_accounts());
     let delete_action = ServerAction::<DeleteAccount>::new();
     let revoke_action = ServerAction::<RevokeAllCerts>::new();
+
+    let lc_exporting = RwSignal::new(false);
+    let lc_export_result = RwSignal::<Option<Result<LcCertExport, String>>>::new(None);
+
+    let app_ids_loading = RwSignal::new(false);
+    let app_ids_result = RwSignal::<Option<Result<AppIdsResult, String>>>::new(None);
+    let app_ids_label = RwSignal::new(String::new());
 
     Effect::new(move |_| {
         if delete_action.version().get() > 0 {
@@ -84,6 +94,9 @@ pub fn Accounts() -> impl IntoView {
                                                     .map(|a| {
                                                         let delete_id = a.id.clone();
                                                         let revoke_id = a.id.clone();
+                                                        let export_id = a.id.clone();
+                                                        let appids_id = a.id.clone();
+                                                        let appids_email = a.apple_id.clone();
                                                         let delete_msg = format!(
                                                             "Remove account \"{}\" from JAS? Installed apps signed with this account will keep running until their certs expire.",
                                                             a.apple_id,
@@ -105,6 +118,57 @@ pub fn Accounts() -> impl IntoView {
                                                                         })}
                                                                 </td>
                                                                 <td class="actions">
+                                                                    <button
+                                                                        type="button"
+                                                                        class="btn btn-sm btn-secondary"
+                                                                        prop:disabled=app_ids_loading
+                                                                        on:click=move |_| {
+                                                                            app_ids_loading.set(true);
+                                                                            app_ids_result.set(None);
+                                                                            app_ids_label.set(appids_email.clone());
+                                                                            let id = appids_id.clone();
+                                                                            leptos::task::spawn_local(async move {
+                                                                                let result = list_account_app_ids(id)
+                                                                                    .await
+                                                                                    .map_err(|e| e.to_string());
+                                                                                app_ids_result.set(Some(result));
+                                                                                app_ids_loading.set(false);
+                                                                            });
+                                                                        }
+                                                                    >
+                                                                        {move || {
+                                                                            if app_ids_loading.get() {
+                                                                                "Loading..."
+                                                                            } else {
+                                                                                "App IDs"
+                                                                            }
+                                                                        }}
+                                                                    </button>
+                                                                    <button
+                                                                        type="button"
+                                                                        class="btn btn-sm btn-secondary"
+                                                                        prop:disabled=lc_exporting
+                                                                        on:click=move |_| {
+                                                                            lc_exporting.set(true);
+                                                                            lc_export_result.set(None);
+                                                                            let id = export_id.clone();
+                                                                            leptos::task::spawn_local(async move {
+                                                                                let result = export_livecontainer_cert(id)
+                                                                                    .await
+                                                                                    .map_err(|e| e.to_string());
+                                                                                lc_export_result.set(Some(result));
+                                                                                lc_exporting.set(false);
+                                                                            });
+                                                                        }
+                                                                    >
+                                                                        {move || {
+                                                                            if lc_exporting.get() {
+                                                                                "Exporting..."
+                                                                            } else {
+                                                                                "Export LC Cert"
+                                                                            }
+                                                                        }}
+                                                                    </button>
                                                                     <form on:submit=move |e: leptos::ev::SubmitEvent| {
                                                                         e.prevent_default();
                                                                         if confirm(&revoke_msg) {
@@ -145,6 +209,142 @@ pub fn Accounts() -> impl IntoView {
                     }}
                 </Suspense>
             </section>
+
+            {move || {
+                app_ids_result.get().map(|result| match result {
+                    Err(e) => {
+                        view! {
+                            <div class="alert alert-error">"App ID list failed: " {e}</div>
+                        }
+                            .into_any()
+                    }
+                    Ok(data) => {
+                        let label = app_ids_label.get();
+                        let summary = match (data.max_quantity, data.available_quantity) {
+                            (Some(max), Some(avail)) => {
+                                let used = max.saturating_sub(avail.max(0) as u64);
+                                format!("{used} / {max} slots used")
+                            }
+                            _ => format!("{} registered", data.entries.len()),
+                        };
+                        view! {
+                            <section class="card">
+                                <h2>"App IDs — " {label}</h2>
+                                <p class="muted" style="margin-bottom:12px">{summary}</p>
+                                {if data.entries.is_empty() {
+                                    view! {
+                                        <p class="muted">"No App IDs registered."</p>
+                                    }
+                                        .into_any()
+                                } else {
+                                    view! {
+                                        <table class="table">
+                                            <thead>
+                                                <tr>
+                                                    <th>"Name"</th>
+                                                    <th>"Identifier"</th>
+                                                    <th>"Expires In"</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {data
+                                                    .entries
+                                                    .into_iter()
+                                                    .map(|e| {
+                                                        #[cfg(target_arch = "wasm32")]
+                                                        let now_secs = (js_sys::Date::now() / 1000.0)
+                                                            as i64;
+                                                        #[cfg(not(target_arch = "wasm32"))]
+                                                        let now_secs = chrono::Local::now().timestamp();
+
+                                                        let expiry_label = e
+                                                            .expiration_date
+                                                            .map(|ts| round_up_duration(ts - now_secs))
+                                                            .unwrap_or_else(|| "-".to_string());
+                                                        let expiry_class = if expiry_label
+                                                            == "Expired"
+                                                        {
+                                                            "error"
+                                                        } else {
+                                                            ""
+                                                        };
+                                                        view! {
+                                                            <tr>
+                                                                <td>{e.name}</td>
+                                                                <td class="mono">
+                                                                    {e.identifier}
+                                                                </td>
+                                                                <td class=expiry_class>
+                                                                    {expiry_label}
+                                                                </td>
+                                                            </tr>
+                                                        }
+                                                    })
+                                                    .collect_view()}
+                                            </tbody>
+                                        </table>
+                                    }
+                                        .into_any()
+                                }}
+                            </section>
+                        }
+                            .into_any()
+                    }
+                })
+            }}
+
+            {move || {
+                lc_export_result.get().map(|result| match result {
+                    Err(e) => {
+                        view! {
+                            <div class="alert alert-error">"Certificate export failed: " {e}</div>
+                        }
+                            .into_any()
+                    }
+                    Ok(cert) => {
+                        let download_href = format!(
+                            "data:application/octet-stream;base64,{}",
+                            cert.p12_b64,
+                        );
+                        // livecontainer://certificate?cert=<BASE64>&password=<PW>
+                        // Base64 uses +, /, = which must be percent-encoded in a query string.
+                        let lc_cert_encoded = cert.p12_b64
+                            .replace('+', "%2B")
+                            .replace('/', "%2F")
+                            .replace('=', "%3D");
+                        let lc_href = format!(
+                            "livecontainer://certificate?cert={}&password={}",
+                            lc_cert_encoded,
+                            cert.password,
+                        );
+                        view! {
+                            <section class="card lc-cert-export">
+                                <h2>"LiveContainer Certificate"</h2>
+                                <p class="muted">
+                                    "Use \"Add to LiveContainer\" to import directly, or download "
+                                    "the file and rename it from "
+                                    <code>".p"</code> " to " <code>".p12"</code>
+                                    " in the Files app before importing manually."
+                                </p>
+                                <p>"Password: " <code>{cert.password.clone()}</code></p>
+                                <div class="lc-cert-actions">
+                                    <a class="btn btn-primary" href=lc_href>
+                                        "Add to LiveContainer"
+                                    </a>
+                                    <a
+                                        class="btn btn-secondary"
+                                        href=download_href
+                                        download="ALTCertificate.p"
+                                    >
+                                        "Download ALTCertificate.p"
+                                    </a>
+                                </div>
+                            </section>
+                        }
+                            .into_any()
+                    }
+                })
+            }}
         </div>
     }
 }

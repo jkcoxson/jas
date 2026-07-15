@@ -33,6 +33,8 @@ certificate expiry, with a misagent-only fast path before falling back to a full
 sign + install
 - Ephemeral install mode for IPAs you don't want stored on the server
 - Live job progress via reactive server function polling
+- LiveContainer support: export the current iOS development certificate as a
+  PKCS#12 file directly from the Accounts page
 - Works in sleep mode
 
 ---
@@ -87,10 +89,10 @@ Output: a single binary at `target/release/jas` and a `target/site/` directory o
 static assets. Both must be present at runtime (`LEPTOS_SITE_ROOT` points the
 binary to the assets, configurable in `Cargo.toml` under `[package.metadata.leptos]`).
 
-To run on Linux:
+To run on Linux (Place /target/site next to the jas binary):
 
 ```bash
-JAS_SECRET_KEY=<32-byte-hex> ./target/release/jas
+JAS_SECRET_KEY=<32-byte-hex> ./jas
 ```
 
 The `JAS_SECRET_KEY` flag is optional but protects your data locally. You can build the project yourself or download a prebuilt binary from [GitHub Actions](https://github.com/jkcoxson/jas/actions).
@@ -232,8 +234,9 @@ CREATE TABLE jobs (
     stage       TEXT
 );
 
--- Generic key/value store used by isideload for the per-device dev cert + private
--- key, and per-Apple-ID anisette state / xcode.auth token.
+-- Generic key/value store. Used by isideload for per-Apple-ID anisette state
+-- and cached xcode.auth tokens, and by JAS for live-editable settings
+-- (e.g. "_server/anisette_url").
 CREATE TABLE sideload_storage (
     key   TEXT NOT NULL PRIMARY KEY,
     value TEXT NOT NULL
@@ -329,14 +332,25 @@ Live job progress shown inline. "Sync from device" reconciles the DB against
 initial GrandSlam handshake and never stored; only the SPD session and the
 minted xcode.auth token are persisted, encrypted. When Apple requires 2FA,
 the UI surfaces an inline code prompt that resumes the same server-side login.
-Each row lists `apple_id`, `team_name (team_id)`, and two actions:
-**Revoke Certs** (revokes every iOS development certificate on the team via
-Apple's developer API; apps signed with the revoked cert stop launching until
-reinstalled) and **Remove** (deletes the account row from JAS, installed apps
-keep running until their existing cert expires).
+Each row lists `apple_id`, `team_name (team_id)`, and three actions:
 
-**`/settings` — Server Config**: IPA storage path, refresh interval, worker
-pool size, log level.
+- **App IDs** — fetches and displays all registered App IDs for the team
+  (name, bundle identifier, expiry date) with the slot count used vs. the
+  team maximum.
+- **Export LC Cert** — provisions or retrieves the current iOS development
+  certificate and exports it as a PKCS#12 file (`.p` extension; rename to
+  `.p12` in the Files app before importing into LiveContainer). The file
+  password is shown alongside the download link.
+- **Revoke Certs** — revokes every iOS development certificate on the team
+  via Apple's developer API; apps signed with the revoked cert stop launching
+  until reinstalled.
+- **Remove** — deletes the account row from JAS; installed apps keep running
+  until their existing cert expires.
+
+**`/settings` — Server Config**: Read-only view of `jas.toml` values (bind
+address, log level, storage paths, scheduler tuning, mDNS). Also contains a
+live-editable **Anisette Server** field — changes take effect immediately and
+persist across restarts.
 
 ---
 
@@ -367,6 +381,13 @@ secret_key = ""   # 32-byte hex string
 mdns_enabled = true
 mdns_interface = ""   # empty = all interfaces
 ```
+
+### Environment variables
+
+| Variable | Description |
+| --- | --- |
+| `JAS_SECRET_KEY` | 32-byte hex encryption key (recommended over `jas.toml`) |
+| `JAS_CONFIG` | Path to config file (default: `jas.toml`) |
 
 ---
 
