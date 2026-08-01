@@ -580,7 +580,7 @@ pub async fn install_ipa(
 
     info!("Signing {ipa_path}");
     let (signed_path, _special) = sideloader
-        .sign_app(PathBuf::from(ipa_path), Some(team), false)
+        .sign_app(PathBuf::from(ipa_path), Some(team), true)
         .await
         .map_err(|e| anyhow::anyhow!("sign_app failed: {e}"))?;
 
