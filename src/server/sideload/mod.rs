@@ -203,9 +203,9 @@ pub async fn fetch_device_identity(
     Ok((udid, name))
 }
 
-/// TCP-level reachability check on port 49152. Returns round-trip ms.
-pub async fn tcp_ping(device_ip: &str, mdns_ip: Option<&str>) -> anyhow::Result<u64> {
-    let ip = mdns_ip.filter(|&m| m != device_ip).unwrap_or(device_ip);
+/// TCP-level reachability check on port 49152 against a single address.
+/// Returns round-trip ms.
+async fn tcp_ping_one(ip: &str) -> anyhow::Result<u64> {
     let start = std::time::Instant::now();
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -215,6 +215,25 @@ pub async fn tcp_ping(device_ip: &str, mdns_ip: Option<&str>) -> anyhow::Result<
     .map_err(|_| anyhow::anyhow!("TCP connect to {ip}:49152 timed out"))?
     .map_err(|e| anyhow::anyhow!("TCP connect to {ip}:49152 failed: {e}"))?;
     Ok(start.elapsed().as_millis() as u64)
+}
+
+/// TCP-level reachability check on port 49152, preferring the mDNS-discovered
+/// LAN IP and falling back to the manually configured IP when that fails. This
+/// mirrors `open_cdtunnel_preferring_mdns` so a stale mDNS address never blocks
+/// an operation that would have succeeded over the manual IP.
+pub async fn tcp_ping(device_ip: &str, mdns_ip: Option<&str>) -> anyhow::Result<u64> {
+    if let Some(ip) = mdns_ip.filter(|&m| m != device_ip) {
+        match tcp_ping_one(ip).await {
+            Ok(ms) => return Ok(ms),
+            Err(e) => {
+                info!("mDNS IP {ip} unreachable ({e}); falling back to manual IP {device_ip}");
+                return tcp_ping_one(device_ip).await.map_err(|manual_err| {
+                    anyhow::anyhow!("{manual_err} (mDNS IP also unreachable: {e})")
+                });
+            }
+        }
+    }
+    tcp_ping_one(device_ip).await
 }
 
 /// Parse a pairing plist to confirm it is structurally valid.
