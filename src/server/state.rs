@@ -1,13 +1,20 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::atomic::AtomicBool, sync::Arc};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use sqlx::SqlitePool;
 
 use crate::server::{config::Config, crypto::Crypto};
 
-/// A pending 2FA login waiting for a code from the user.
+/// A login in flight, possibly parked waiting on the user for two-factor auth.
 pub struct PendingLogin {
-    pub code_sender: std::sync::mpsc::SyncSender<Option<String>>,
+    /// Delivers the user's answer to the login thread blocked in the 2FA callback.
+    pub action_sender: std::sync::mpsc::SyncSender<crate::app::TwoFactorAction>,
+    /// What Apple is currently asking for. Set by the login thread before it
+    /// blocks; taken by whoever answers it.
+    pub prompt: std::sync::Mutex<Option<crate::app::TwoFactorPrompt>>,
     pub result: Arc<Mutex<Option<Result<LoginData, String>>>>,
+    /// Set once the account has been written to the database, so concurrent
+    /// pollers can't insert it twice.
+    pub finalized: AtomicBool,
 }
 
 #[derive(Clone)]

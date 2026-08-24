@@ -2,8 +2,9 @@ use leptos::prelude::*;
 
 use crate::app::components::{confirm, round_up_duration};
 use crate::app::{
-    begin_login, complete_login, export_livecontainer_cert, list_account_app_ids, list_accounts,
-    AppIdsResult, DeleteAccount, LcCertExport, RevokeAllCerts,
+    begin_login, export_livecontainer_cert, list_account_app_ids, list_accounts, poll_login,
+    submit_two_factor, AppIdsResult, DeleteAccount, LcCertExport, LoginStep, RevokeAllCerts,
+    TrustedNumberInfo, TwoFactorAction, TwoFactorPrompt,
 };
 
 #[component]
@@ -354,9 +355,50 @@ fn AddAccountForm(#[prop(into)] on_success: Callback<()>) -> impl IntoView {
     let apple_id = RwSignal::new(String::new());
     let password = RwSignal::new(String::new());
     let session_key = RwSignal::<Option<String>>::new(None);
+    let prompt = RwSignal::<Option<TwoFactorPrompt>>::new(None);
     let tfa_code = RwSignal::new(String::new());
     let error_msg = RwSignal::<Option<String>>::new(None);
     let pending = RwSignal::new(false);
+
+    // Advance the login, polling through any `Pending` steps, until it either
+    // completes or parks on something the user has to answer.
+    let advance = move |key: String, first: LoginStep| {
+        leptos::task::spawn_local(async move {
+            let mut step = Ok(first);
+            loop {
+                match step {
+                    Ok(LoginStep::Complete) => {
+                        session_key.set(None);
+                        prompt.set(None);
+                        tfa_code.set(String::new());
+                        password.set(String::new());
+                        on_success.run(());
+                        break;
+                    }
+                    Ok(LoginStep::TwoFactor { prompt: p }) => {
+                        // A fresh prompt means the previous code was rejected or a
+                        // new one was sent; clear the stale input either way.
+                        tfa_code.set(String::new());
+                        session_key.set(Some(key.clone()));
+                        prompt.set(Some(p));
+                        break;
+                    }
+                    Ok(LoginStep::Pending) => {
+                        session_key.set(Some(key.clone()));
+                        prompt.set(None);
+                        step = poll_login(key.clone()).await;
+                    }
+                    Err(e) => {
+                        error_msg.set(Some(e.to_string()));
+                        session_key.set(None);
+                        prompt.set(None);
+                        break;
+                    }
+                }
+            }
+            pending.set(false);
+        });
+    };
 
     let on_submit = move |e: leptos::ev::SubmitEvent| {
         e.prevent_default();
@@ -367,48 +409,69 @@ fn AddAccountForm(#[prop(into)] on_success: Callback<()>) -> impl IntoView {
 
         leptos::task::spawn_local(async move {
             match begin_login(id, pw).await {
-                Ok((key, needs_2fa)) => {
-                    if needs_2fa {
-                        session_key.set(Some(key));
-                    } else {
-                        on_success.run(());
-                    }
-                }
+                Ok((key, step)) => advance(key, step),
                 Err(e) => {
                     error_msg.set(Some(e.to_string()));
+                    pending.set(false);
                 }
             }
-            pending.set(false);
+        });
+    };
+
+    // Answer the outstanding prompt with `action`.
+    let act = move |action: TwoFactorAction| {
+        let key = match session_key.get() {
+            Some(k) => k,
+            None => return,
+        };
+        pending.set(true);
+        error_msg.set(None);
+        // Hide the form while the request is in flight so the options can't be
+        // double-submitted; `advance` restores it if Apple asks again.
+        prompt.set(None);
+
+        leptos::task::spawn_local(async move {
+            match submit_two_factor(key.clone(), action).await {
+                Ok(step) => advance(key, step),
+                Err(e) => {
+                    error_msg.set(Some(e.to_string()));
+                    pending.set(false);
+                }
+            }
         });
     };
 
     let on_2fa_submit = move |e: leptos::ev::SubmitEvent| {
         e.prevent_default();
+        act(TwoFactorAction::SubmitCode(tfa_code.get()));
+    };
+
+    // Abort ends the login outright, so it resets the form rather than polling
+    // for a next step the way `act` does.
+    let cancel = move |_| {
         let key = match session_key.get() {
             Some(k) => k,
             None => return,
         };
-        let code = tfa_code.get();
         pending.set(true);
         error_msg.set(None);
+        prompt.set(None);
 
         leptos::task::spawn_local(async move {
-            match complete_login(key, code).await {
-                Ok(()) => {
-                    session_key.set(None);
-                    on_success.run(());
-                }
-                Err(e) => {
-                    error_msg.set(Some(e.to_string()));
-                }
-            }
+            // Best effort: unblocks the login thread so it tears down promptly
+            // instead of sitting out its five-minute timeout.
+            let _ = submit_two_factor(key, TwoFactorAction::Abort).await;
+            session_key.set(None);
+            tfa_code.set(String::new());
+            password.set(String::new());
             pending.set(false);
         });
     };
 
     view! {
         {move || {
-            if session_key.get().is_none() {
+            let key = session_key.get();
+            if key.is_none() {
                 view! {
                     <form on:submit=on_submit>
                         <div class="form-row">
@@ -441,31 +504,177 @@ fn AddAccountForm(#[prop(into)] on_success: Callback<()>) -> impl IntoView {
                 }
                     .into_any()
             } else {
-                view! {
-                    <form on:submit=on_2fa_submit>
-                        <p>"A two-factor code was sent to your trusted device."</p>
-                        <div class="form-row">
-                            <label class="form-field">
-                                "2FA Code"
-                                <input
-                                    type="text"
-                                    required
-                                    placeholder="000000"
-                                    maxlength="6"
-                                    prop:value=tfa_code
-                                    on:input=move |e| tfa_code.set(event_target_value(&e))
+                match prompt.get() {
+                    // Waiting on Apple between steps.
+                    None => {
+                        view! {
+                            <div class="tfa-step">
+                                <p class="hint">"Contacting Apple..."</p>
+                            </div>
+                        }
+                            .into_any()
+                    }
+                    // The previous method failed and Apple won't say which one to
+                    // use, so only offer a choice of method -- a code can't be
+                    // submitted from this state.
+                    Some(p) if p.unknown => {
+                        view! {
+                            <div class="tfa-step">
+                                <p>
+                                    "That verification method didn't work. Choose another way to receive your code."
+                                </p>
+                                <TwoFactorMethods
+                                    numbers=p.numbers.clone()
+                                    show_devices=true
+                                    pending=pending
+                                    act=act
                                 />
-                            </label>
-                        </div>
-                        <button type="submit" class="btn btn-primary" prop:disabled=pending>
-                            {move || if pending.get() { "Verifying..." } else { "Submit Code" }}
-                        </button>
-                    </form>
+                                <button
+                                    type="button"
+                                    class="btn btn-secondary btn-sm"
+                                    prop:disabled=pending
+                                    on:click=cancel
+                                >
+                                    "Cancel"
+                                </button>
+                            </div>
+                        }
+                            .into_any()
+                    }
+                    Some(p) => {
+                        let sms = p.sms;
+                        let target = p
+                            .selected_number_id
+                            .and_then(|id| p.numbers.iter().find(|n| n.id == id))
+                            .map(|n| n.number.clone());
+                        let numbers = p.numbers.clone();
+
+                        view! {
+                            <div class="tfa-step">
+                                <p>
+                                    {if sms {
+                                        match target {
+                                            Some(n) => format!("Enter the code texted to {n}."),
+                                            None => "Enter the code sent by text message.".to_string(),
+                                        }
+                                    } else {
+                                        "A two-factor code was sent to your trusted devices."
+                                            .to_string()
+                                    }}
+                                </p>
+                                <form on:submit=on_2fa_submit>
+                                    <div class="form-row">
+                                        <label class="form-field">
+                                            "2FA Code"
+                                            <input
+                                                type="text"
+                                                required
+                                                inputmode="numeric"
+                                                autocomplete="one-time-code"
+                                                placeholder="000000"
+                                                maxlength="6"
+                                                prop:value=tfa_code
+                                                on:input=move |e| tfa_code.set(event_target_value(&e))
+                                            />
+                                        </label>
+                                    </div>
+                                    <button
+                                        type="submit"
+                                        class="btn btn-primary"
+                                        prop:disabled=pending
+                                    >
+                                        {move || {
+                                            if pending.get() { "Verifying..." } else { "Submit Code" }
+                                        }}
+                                    </button>
+                                </form>
+
+                                <p class="hint tfa-alt-label">"Didn't get it?"</p>
+                                <div class="tfa-methods">
+                                    <button
+                                        type="button"
+                                        class="btn btn-secondary btn-sm"
+                                        prop:disabled=pending
+                                        on:click=move |_| act(TwoFactorAction::ResendCode)
+                                    >
+                                        "Resend code"
+                                    </button>
+                                </div>
+                                <TwoFactorMethods
+                                    numbers=numbers
+                                    show_devices=sms
+                                    pending=pending
+                                    act=act
+                                />
+                                <button
+                                    type="button"
+                                    class="btn btn-secondary btn-sm"
+                                    prop:disabled=pending
+                                    on:click=cancel
+                                >
+                                    "Cancel"
+                                </button>
+                            </div>
+                        }
+                            .into_any()
+                    }
                 }
-                    .into_any()
             }
         }}
 
         {move || error_msg.get().map(|e| view! { <p class="error">{e}</p> })}
     }
+}
+
+/// The alternate ways to get a code: text any trusted number, or push to the
+/// account's trusted devices.
+#[component]
+fn TwoFactorMethods<F>(
+    numbers: Vec<TrustedNumberInfo>,
+    /// Offer the trusted-devices route (pointless when it's already in use).
+    show_devices: bool,
+    pending: RwSignal<bool>,
+    act: F,
+) -> impl IntoView
+where
+    F: Fn(TwoFactorAction) + Copy + Send + Sync + 'static,
+{
+    if numbers.is_empty() && !show_devices {
+        return ().into_any();
+    }
+
+    view! {
+        <div class="tfa-methods">
+            {show_devices
+                .then(|| {
+                    view! {
+                        <button
+                            type="button"
+                            class="btn btn-secondary btn-sm"
+                            prop:disabled=pending
+                            on:click=move |_| act(TwoFactorAction::SendToDevices)
+                        >
+                            "Send to trusted devices"
+                        </button>
+                    }
+                })}
+            {numbers
+                .into_iter()
+                .map(|n| {
+                    let id = n.id;
+                    view! {
+                        <button
+                            type="button"
+                            class="btn btn-secondary btn-sm"
+                            prop:disabled=pending
+                            on:click=move |_| act(TwoFactorAction::SendSms(id))
+                        >
+                            {format!("Text {}", n.number)}
+                        </button>
+                    }
+                })
+                .collect_view()}
+        </div>
+    }
+        .into_any()
 }

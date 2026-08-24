@@ -215,6 +215,20 @@ body {
 
 .hint { font-size: 12px; color: var(--muted); margin-bottom: 12px; }
 
+// Two-factor auth step
+.tfa-step {
+  p { margin: 0 0 12px; font-size: 14px; }
+
+  .tfa-alt-label { margin: 16px 0 6px; }
+}
+
+.tfa-methods {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
 // Tables
 .table {
   width: 100%;

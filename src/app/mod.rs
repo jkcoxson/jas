@@ -107,6 +107,72 @@ pub struct LcCertExport {
     pub password: String,
 }
 
+/// A trusted phone number Apple offers as an SMS destination.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TrustedNumberInfo {
+    pub id: u32,
+    /// Masked number as Apple formats it, e.g. "+1 (•••) •••-••89".
+    pub number: String,
+    pub last_two_digits: String,
+}
+
+/// What Apple is currently asking the user for during two-factor auth.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TwoFactorPrompt {
+    /// The last method failed and Apple won't say which one to use; the user
+    /// has to pick a different one rather than enter a code.
+    pub unknown: bool,
+    /// True when the pending code was sent by SMS rather than to trusted devices.
+    pub sms: bool,
+    pub numbers: Vec<TrustedNumberInfo>,
+    /// Which number the pending SMS went to, when `sms` is set.
+    pub selected_number_id: Option<u32>,
+}
+
+/// The user's answer to a [`TwoFactorPrompt`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum TwoFactorAction {
+    SubmitCode(String),
+    /// Text a fresh code to the trusted number with this id.
+    SendSms(u32),
+    /// Push a fresh code to the account's trusted devices.
+    SendToDevices,
+    /// Re-send using whichever method is already in flight.
+    ResendCode,
+    Abort,
+}
+
+/// Where a login attempt currently stands.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum LoginStep {
+    /// Still talking to Apple; poll again.
+    Pending,
+    /// Blocked on the user, who should be shown `prompt`.
+    TwoFactor { prompt: TwoFactorPrompt },
+    /// Logged in and the account has been saved.
+    Complete,
+}
+
+#[cfg(feature = "ssr")]
+impl From<isideload::auth::apple_account::TwoFactorCallbackParams> for TwoFactorPrompt {
+    fn from(p: isideload::auth::apple_account::TwoFactorCallbackParams) -> Self {
+        Self {
+            unknown: p.unknown,
+            sms: p.sms,
+            numbers: p
+                .numbers
+                .into_iter()
+                .map(|n| TrustedNumberInfo {
+                    id: n.id,
+                    number: n.number_with_dial_code,
+                    last_two_digits: n.last_two_digits,
+                })
+                .collect(),
+            selected_number_id: p.selected_number_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppIdEntry {
     pub name: String,
@@ -331,11 +397,11 @@ pub async fn list_accounts() -> Result<Vec<AccountInfo>, ServerFnError> {
 pub async fn begin_login(
     apple_id: String,
     password: String,
-) -> Result<(String, bool), ServerFnError> {
+) -> Result<(String, LoginStep), ServerFnError> {
     use crate::server::sideload;
     use crate::server::state::{AppState, LoginData, PendingLogin};
     use isideload::{
-        auth::apple_account::AppleAccount,
+        auth::apple_account::{AppleAccount, TwoFactorCallbackParams, TwoFactorCallbackResponse},
         dev::{developer_session::DeveloperSession, teams::TeamsApi},
     };
     use leptos::prelude::use_context;
@@ -345,26 +411,31 @@ pub async fn begin_login(
 
     let session_key = uuid::Uuid::new_v4().to_string();
 
-    // Channel for 2FA code from the user.
-    let (code_tx, code_rx) = std::sync::mpsc::sync_channel::<Option<String>>(1);
+    // Carries the user's chosen action to the login thread blocked in the 2FA callback.
+    let (action_tx, action_rx) = std::sync::mpsc::sync_channel::<TwoFactorAction>(1);
     let result_cell: Arc<tokio::sync::Mutex<Option<Result<LoginData, String>>>> =
         Arc::new(tokio::sync::Mutex::new(None));
 
     let pending = Arc::new(PendingLogin {
-        code_sender: code_tx,
+        action_sender: action_tx,
+        prompt: std::sync::Mutex::new(None),
         result: result_cell.clone(),
+        finalized: std::sync::atomic::AtomicBool::new(false),
     });
 
     {
         let mut logins = state.pending_logins.lock().await;
-        logins.insert(session_key.clone(), pending);
+        // Drop sessions that already reached a result but were never collected
+        // (the user closed the tab mid-2FA), so the map can't grow without bound.
+        logins.retain(|_, p| p.result.try_lock().map(|r| r.is_none()).unwrap_or(true));
+        logins.insert(session_key.clone(), pending.clone());
     }
 
     let apple_id_clone = apple_id.clone();
     let password_clone = password.clone();
     let state_clone = state.clone();
-    let session_key_clone = session_key.clone();
     let result_clone = result_cell.clone();
+    let pending_clone = pending.clone();
 
     // Spawn a thread with its own runtime so the sync 2FA callback doesn't block tokio threads.
     std::thread::spawn(move || {
@@ -391,14 +462,44 @@ pub async fn begin_login(
                 .await
                 .map_err(|e| format!("Account init: {e}"))?;
 
+            // The callback is re-entered for every 2FA round trip (wrong code, a
+            // resend, switching methods), so the receiver lives behind a mutex to
+            // satisfy the `Sync` bound on the callback type.
+            let action_rx = std::sync::Mutex::new(action_rx);
+
             account
-                .login(&password_clone, move || {
-                    // Block waiting for the 2FA code from the web UI (5-min timeout).
-                    code_rx
-                        .recv_timeout(std::time::Duration::from_secs(300))
-                        .ok()
-                        .flatten()
-                })
+                .login(
+                    &password_clone,
+                    Box::new(move |params: TwoFactorCallbackParams| {
+                        // Publish what Apple wants so the UI can render the right options.
+                        *pending_clone.prompt.lock().unwrap() =
+                            Some(TwoFactorPrompt::from(params));
+
+                        // Block until the web UI answers (5-minute timeout).
+                        let action = action_rx.lock().ok().and_then(|rx| {
+                            rx.recv_timeout(std::time::Duration::from_secs(300)).ok()
+                        });
+
+                        match action {
+                            Some(TwoFactorAction::SubmitCode(code)) => {
+                                TwoFactorCallbackResponse::SubmitCode(code)
+                            }
+                            Some(TwoFactorAction::SendSms(id)) => {
+                                TwoFactorCallbackResponse::SendSms(id)
+                            }
+                            Some(TwoFactorAction::SendToDevices) => {
+                                TwoFactorCallbackResponse::SendToDevices
+                            }
+                            Some(TwoFactorAction::ResendCode) => {
+                                TwoFactorCallbackResponse::ResendCode
+                            }
+                            // Explicit cancel, or the user walked away.
+                            Some(TwoFactorAction::Abort) | None => {
+                                TwoFactorCallbackResponse::Abort
+                            }
+                        }
+                    }),
+                )
                 .await
                 .map_err(|e| format!("Login failed: {e}"))?;
 
@@ -439,43 +540,78 @@ pub async fn begin_login(
             })
         });
 
-        // Write result back.
+        // Write result back. The session stays in the pending map until a caller
+        // observes this result, otherwise a successful login could be dropped.
         rt.block_on(async {
             *result_clone.lock().await = Some(outcome);
         });
-
-        // Remove from pending map.
-        rt.block_on(async {
-            state_clone
-                .pending_logins
-                .lock()
-                .await
-                .remove(&session_key_clone);
-        });
     });
 
-    // Wait to see if it resolves without 2FA.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // Wait to see if it resolves without 2FA, or asks for a code.
+    let step = await_login_step(&state, &session_key, &pending).await?;
+    Ok((session_key, step))
+}
 
-    let outcome_opt = result_cell.lock().await.clone();
-    if let Some(outcome) = outcome_opt {
-        return finalize_login(state, outcome.as_ref().map_err(|e| e.as_str()))
-            .await
-            .map(|_| (session_key, false));
+/// Polls a login for its next step, returning [`LoginStep::Pending`] if it is
+/// still working after `WAIT`. Finalizes (and cleans up) a login that finished.
+#[cfg(feature = "ssr")]
+async fn await_login_step(
+    state: &crate::server::state::AppState,
+    session_key: &str,
+    pending: &std::sync::Arc<crate::server::state::PendingLogin>,
+) -> Result<LoginStep, ServerFnError> {
+    use std::sync::atomic::Ordering;
+
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+    const TICK: std::time::Duration = std::time::Duration::from_millis(150);
+
+    let deadline = std::time::Instant::now() + WAIT;
+
+    loop {
+        let outcome = pending.result.lock().await.clone();
+        if let Some(outcome) = outcome {
+            state.pending_logins.lock().await.remove(session_key);
+            let data = outcome.map_err(ServerFnError::new)?;
+            // Guard against two in-flight pollers both inserting the account.
+            if !pending.finalized.swap(true, Ordering::SeqCst) {
+                finalize_login(state, &data).await?;
+            }
+            return Ok(LoginStep::Complete);
+        }
+
+        let prompt = pending.prompt.lock().unwrap().clone();
+        if let Some(prompt) = prompt {
+            return Ok(LoginStep::TwoFactor { prompt });
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Ok(LoginStep::Pending);
+        }
+        tokio::time::sleep(TICK).await;
     }
+}
 
-    // Login is still running
-    Ok((session_key, true))
+#[cfg(feature = "ssr")]
+fn lookup_login(
+    logins: &std::collections::HashMap<
+        String,
+        std::sync::Arc<crate::server::state::PendingLogin>,
+    >,
+    session_key: &str,
+) -> Result<std::sync::Arc<crate::server::state::PendingLogin>, ServerFnError> {
+    logins
+        .get(session_key)
+        .cloned()
+        .ok_or_else(|| ServerFnError::new("Session not found or expired"))
 }
 
 #[cfg(feature = "ssr")]
 async fn finalize_login(
-    state: crate::server::state::AppState,
-    outcome: Result<&crate::server::state::LoginData, &str>,
+    state: &crate::server::state::AppState,
+    data: &crate::server::state::LoginData,
 ) -> Result<(), ServerFnError> {
     use crate::server::db;
 
-    let data = outcome.map_err(ServerFnError::new)?;
     let encrypted = state.crypto.encrypt(&data.session_plist);
     let id = uuid::Uuid::new_v4().to_string();
 
@@ -491,11 +627,9 @@ async fn finalize_login(
     .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
+/// Check on a login that reported [`LoginStep::Pending`].
 #[server]
-pub async fn complete_login(
-    session_key: String,
-    two_factor_code: String,
-) -> Result<(), ServerFnError> {
+pub async fn poll_login(session_key: String) -> Result<LoginStep, ServerFnError> {
     use crate::server::state::AppState;
     use leptos::prelude::use_context;
 
@@ -503,28 +637,49 @@ pub async fn complete_login(
 
     let pending = {
         let logins = state.pending_logins.lock().await;
-        logins.get(&session_key).cloned()
+        lookup_login(&logins, &session_key)?
     };
 
-    let pending = pending.ok_or_else(|| ServerFnError::new("Session not found or expired"))?;
+    await_login_step(&state, &session_key, &pending).await
+}
 
-    pending
-        .code_sender
-        .send(Some(two_factor_code))
-        .map_err(|_| ServerFnError::new("Login session closed"))?;
+/// Answer the outstanding [`TwoFactorPrompt`] and wait for whatever comes next.
+#[server]
+pub async fn submit_two_factor(
+    session_key: String,
+    action: TwoFactorAction,
+) -> Result<LoginStep, ServerFnError> {
+    use crate::server::state::AppState;
+    use leptos::prelude::use_context;
 
-    // Wait for the background thread to finish.
-    for _ in 0..30 {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let outcome_opt = pending.result.lock().await.clone();
-        if let Some(outcome) = outcome_opt {
-            return finalize_login(state, outcome.as_ref().map_err(|e| e.as_str())).await;
-        }
+    let state = use_context::<AppState>().ok_or_else(|| ServerFnError::new("No state"))?;
+
+    let pending = {
+        let logins = state.pending_logins.lock().await;
+        lookup_login(&logins, &session_key)?
+    };
+
+    // Taking the prompt both clears it and proves a callback is actually waiting,
+    // so a double submit can't leave a stale action buffered for the next round.
+    let waiting = pending.prompt.lock().unwrap().take().is_some();
+    if !waiting {
+        return Err(ServerFnError::new("No two-factor request is pending"));
     }
 
-    Err(ServerFnError::new(
-        "Login timed out waiting for Apple servers",
-    ))
+    let aborting = action == TwoFactorAction::Abort;
+
+    pending
+        .action_sender
+        .send(action)
+        .map_err(|_| ServerFnError::new("Login session closed"))?;
+
+    // Nothing more to wait for: the login thread will unwind on its own.
+    if aborting {
+        state.pending_logins.lock().await.remove(&session_key);
+        return Ok(LoginStep::Pending);
+    }
+
+    await_login_step(&state, &session_key, &pending).await
 }
 
 #[server]

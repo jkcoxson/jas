@@ -42,7 +42,7 @@ thiserror = { version = "2" }
 base64 = { version = "0.22" }
 
 # SSR-only
-isideload = { git = "https://github.com/jkcoxson/isideload", branch = "feature/rsd", optional = true, default-features = false, features = [
+isideload = { git = "https://github.com/nab138/isideload", optional = true, default-features = false, features = [
   "install",
 ] }
 idevice = { version = "0.1.61", optional = true, features = [
